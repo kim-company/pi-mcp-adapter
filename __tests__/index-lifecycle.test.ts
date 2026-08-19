@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MCP_STATUS_EVENT } from "../types.ts";
 
 const mocks = vi.hoisted(() => ({
   initializeMcp: vi.fn(),
@@ -116,7 +117,10 @@ function createDeferred<T>() {
 function createState() {
   return {
     manager: { getAllConnections: () => new Map() },
-    lifecycle: { gracefulShutdown: vi.fn().mockResolvedValue(undefined) },
+    lifecycle: {
+      gracefulShutdown: vi.fn().mockResolvedValue(undefined),
+      ensureConverged: vi.fn().mockResolvedValue(undefined),
+    },
     toolMetadata: new Map(),
     config: { mcpServers: {} },
     oauthRuntime: { signal: new AbortController().signal },
@@ -152,6 +156,52 @@ function createPi(options: { unregisterTool?: false | ((name: string) => boolean
         activeTools = nextActiveTools;
       }),
     } as any,
+  };
+}
+
+function createStatusObservingPi() {
+  const { api, handlers } = createPi();
+  let activeTools = ["bash"];
+  const connectedSurfaces: string[][] = [];
+
+  api.registerTool.mockImplementation((tool: { name: string }) => {
+    if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+  });
+  api.unregisterTool.mockImplementation((toolName: string) => {
+    const previousLength = activeTools.length;
+    activeTools = activeTools.filter((name) => name !== toolName);
+    return activeTools.length !== previousLength;
+  });
+  api.getActiveTools.mockImplementation(() => [...activeTools]);
+  api.setActiveTools.mockImplementation((nextActiveTools: string[]) => {
+    activeTools = [...nextActiveTools];
+  });
+  api.events = {
+    emit: vi.fn((channel: string, payload: { connectedCount?: number }) => {
+      if (channel !== MCP_STATUS_EVENT || payload.connectedCount !== 1) return;
+      connectedSurfaces.push(activeTools
+        .filter((name) => name === "mcp" || name.startsWith("demo_"))
+        .sort());
+    }),
+  };
+
+  return { api, handlers, connectedSurfaces };
+}
+
+function connectedStatusSnapshot(toolCount: number) {
+  return {
+    version: 1,
+    servers: [{
+      name: "demo",
+      status: "connected",
+      toolCount,
+      resourceCount: 0,
+      disabled: false,
+    }],
+    totalTools: toolCount,
+    totalResources: 0,
+    connectedCount: 1,
+    disabledCount: 0,
   };
 }
 
@@ -415,6 +465,150 @@ describe("mcpAdapter session lifecycle", () => {
     expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "demo_search" }));
   });
 
+  it("waits for keep-alive convergence before Pi processes the next input", async () => {
+    const config = {
+      mcpServers: {
+        demo: { url: "https://example.test/mcp", lifecycle: "keep-alive" },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    const convergence = createDeferred<void>();
+    state.lifecycle.ensureConverged.mockReturnValue(convergence.promise);
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    let inputCompleted = false;
+    const input = Promise.resolve(handlers.get("input")?.({ type: "input", text: "hello" }, {}))
+      .then(() => { inputCompleted = true; });
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(inputCompleted).toBe(false);
+    convergence.resolve();
+    await input;
+    expect(state.lifecycle.ensureConverged).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for pending lazy-keep-alive initialization before the first input", async () => {
+    const config = {
+      mcpServers: {
+        demo: { url: "https://example.test/mcp", lifecycle: "lazy-keep-alive" },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    const initialization = createDeferred<typeof state>();
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.loadMetadataCache.mockReturnValue(null);
+    mocks.initializeMcp.mockReturnValue(initialization.promise);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+
+    let inputCompleted = false;
+    const input = Promise.resolve(handlers.get("input")?.({ type: "input", text: "hello" }, {}))
+      .then(() => { inputCompleted = true; });
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(inputCompleted).toBe(false);
+    initialization.resolve(state);
+    await input;
+    expect(state.lifecycle.ensureConverged).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds the first-input wait when initialization stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const config = {
+        mcpServers: {
+          demo: { url: "https://example.test/mcp", lifecycle: "keep-alive" },
+        },
+      };
+      const state = createState();
+      const initialization = createDeferred<typeof state>();
+      mocks.loadMcpConfig.mockReturnValue(config);
+      mocks.initializeMcp.mockReturnValue(initialization.promise);
+
+      const { default: mcpAdapter } = await import("../index.ts");
+      const { api, handlers } = createPi();
+      mcpAdapter(api);
+      await handlers.get("session_start")?.({}, {});
+
+      let inputCompleted = false;
+      const input = Promise.resolve(handlers.get("input")?.({ type: "input", text: "hello" }, {}))
+        .then(() => { inputCompleted = true; });
+      await Promise.resolve();
+      expect(inputCompleted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await input;
+      expect(inputCompleted).toBe(true);
+      expect(state.lifecycle.ensureConverged).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles direct tools during the keep-alive input barrier", async () => {
+    const config = {
+      mcpServers: {
+        demo: {
+          url: "https://example.test/mcp",
+          lifecycle: "keep-alive",
+          directTools: true,
+        },
+      },
+    };
+    const oldTool = {
+      serverName: "demo",
+      originalName: "search",
+      prefixedName: "demo_search",
+      description: "Old search",
+    };
+    const newTool = {
+      serverName: "demo",
+      originalName: "lookup",
+      prefixedName: "demo_lookup",
+      description: "New lookup",
+    };
+    const state = createState();
+    state.config = config;
+    state.lifecycle.ensureConverged.mockImplementation(async () => {
+      await state.onToolMetadataUpdated?.("demo", "keep-alive-refresh");
+    });
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.loadMetadataCache.mockReturnValue({ version: 1, servers: {} });
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([oldTool])
+      .mockReturnValueOnce([oldTool])
+      .mockReturnValue([newTool]);
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await handlers.get("input")?.({ type: "input", text: "hello" }, {});
+
+    expect(api.unregisterTool).toHaveBeenCalledWith("demo_search");
+    expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({
+      name: "demo_lookup",
+      description: "New lookup",
+    }));
+  });
+
   it("hot-loads direct tools after session initialization refreshes metadata", async () => {
     const config = {
       mcpServers: {
@@ -451,6 +645,87 @@ describe("mcpAdapter session lifecycle", () => {
     await Promise.resolve();
 
     expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "demo_search" }));
+  });
+
+  it("publishes connected status only after replacing stale cached direct tools", async () => {
+    const config = {
+      settings: { disableProxyTool: true },
+      mcpServers: {
+        demo: { command: "demo-server", lifecycle: "keep-alive", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.loadMetadataCache.mockReturnValue({ version: 1, servers: { demo: {} } });
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([{
+        serverName: "demo",
+        originalName: "stale",
+        prefixedName: "demo_stale",
+        description: "Cached stale tool",
+      }])
+      .mockReturnValue([{
+        serverName: "demo",
+        originalName: "current",
+        prefixedName: "demo_current",
+        description: "Authoritative current tool",
+      }]);
+    mocks.initializeMcp.mockImplementation(async (_pi, _ctx, _owner, options) => {
+      state.statusEvents = options.statusEvents;
+      state.statusEvents?.emit(MCP_STATUS_EVENT, connectedStatusSnapshot(1));
+      return state;
+    });
+    mocks.updateStatusBar.mockImplementation((currentState) => {
+      currentState.statusEvents?.emit(MCP_STATUS_EVENT, connectedStatusSnapshot(1));
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers, connectedSurfaces } = createStatusObservingPi();
+    mcpAdapter(api);
+
+    await handlers.get("session_start")?.({}, { hasUI: false });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(connectedSurfaces).toEqual([["demo_current"]]);
+  });
+
+  it("publishes an authoritative empty catalog only after removing stale cached direct tools", async () => {
+    const config = {
+      settings: { disableProxyTool: true },
+      mcpServers: {
+        demo: { command: "demo-server", lifecycle: "keep-alive", directTools: true },
+      },
+    };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.loadMetadataCache.mockReturnValue({ version: 1, servers: { demo: {} } });
+    mocks.resolveDirectTools
+      .mockReturnValueOnce([{
+        serverName: "demo",
+        originalName: "stale",
+        prefixedName: "demo_stale",
+        description: "Cached stale tool",
+      }])
+      .mockReturnValue([]);
+    mocks.initializeMcp.mockImplementation(async (_pi, _ctx, _owner, options) => {
+      state.statusEvents = options.statusEvents;
+      state.statusEvents?.emit(MCP_STATUS_EVENT, connectedStatusSnapshot(0));
+      return state;
+    });
+    mocks.updateStatusBar.mockImplementation((currentState) => {
+      currentState.statusEvents?.emit(MCP_STATUS_EVENT, connectedStatusSnapshot(0));
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers, connectedSurfaces } = createStatusObservingPi();
+    mcpAdapter(api);
+
+    await handlers.get("session_start")?.({}, { hasUI: false });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(connectedSurfaces).toEqual([["mcp"]]);
   });
 
   it("removes stale direct tools and registers the proxy after metadata refresh", async () => {

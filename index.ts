@@ -299,7 +299,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           }
         : {}),
       oauthRuntime,
-      statusEvents: pi.events,
     });
     initPromise = promise;
 
@@ -325,6 +324,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       };
       syncPromptCommands();
       syncToolSurface(ctx);
+      // A connected snapshot is readiness-like external state. Publish it only
+      // after Pi's model-facing direct-tool surface reflects live metadata.
+      nextState.statusEvents = pi.events;
       updateStatusBar(nextState);
       initPromise = null;
       if (earlyConfig.settings?.freezeDirectTools === true) {
@@ -413,6 +415,29 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       );
       if (missingEnvDirectTools.length > 0) {
         await initialization;
+      }
+    }
+  });
+
+  pi.on("input", async () => {
+    const inputOwner = currentOwner;
+    if (!inputOwner?.isActive()) return;
+
+    if (!state && initPromise) {
+      try {
+        await awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS);
+      } catch {
+        return;
+      }
+    }
+
+    const inputState = state;
+    if (!inputState || !inputOwner.isActive()) return;
+    try {
+      await inputState.lifecycle.ensureConverged(inputOwner.signal);
+    } catch (error) {
+      if (!isAbortError(error, inputOwner.signal)) {
+        logger.debug(`MCP: keep-alive convergence failed before input: ${formatTerminalError(error)}`);
       }
     }
   });
